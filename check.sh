@@ -15,6 +15,10 @@ DOMAIN="${DOMAIN:-bancuh.com}"
 NODES="${NODES:-}"
 QNAME="${QNAME:-careers.opendns.com}"
 TIMEOUT="${TIMEOUT:-8}"
+# Alert once a cert drops below this. Let's Encrypt certs are 90 days and
+# renewal begins at 30 days remaining, so anything under ~21 means a renewal
+# that should already have happened has not.
+WARN_DAYS="${WARN_DAYS:-21}"
 
 [ -n "$NODES" ] || { echo "FATAL: NODES is empty"; exit 1; }
 
@@ -66,9 +70,52 @@ check() { # short_name proto
   push "$_token" up "$_proto ok" "$_ms"
 }
 
+check_cert() { # short_name
+  _n="$1"
+  _host="$_n.$DOMAIN"
+  _key=$(echo "$_n" | tr 'a-z-' 'A-Z_' | tr -cd 'A-Z0-9_')
+  eval "_token=\${TOKEN_${_key}_CERT:-}"
+
+  # curl's %{certs} emits the whole chain, leaf first, as
+  # "Expire date:Oct 14 23:49:00 2026 GMT". head -1 therefore takes the leaf --
+  # taking a later one would track a Let's Encrypt intermediate's multi-year
+  # expiry and never alert. busybox date cannot parse that string directly, so
+  # strip the zone and hand it an explicit format. Everything here is UTC.
+  _exp=$(curl -sS --max-time 10 -o /dev/null -w '%{certs}' "https://$_host/dns-query" 2>/dev/null \
+         | sed -n 's/^Expire date:\(.*\) GMT$/\1/p' | head -1)
+
+  if [ -z "$_exp" ]; then
+    echo "DOWN $_host cert: could not read certificate"
+    push "$_token" down "cert: could not read certificate" 0
+    return
+  fi
+
+  _end=$(date -u -D '%b %d %H:%M:%S %Y' -d "$_exp" +%s 2>/dev/null)
+  if [ -z "$_end" ]; then
+    echo "DOWN $_host cert: could not parse expiry '$_exp'"
+    push "$_token" down "cert: could not parse expiry" 0
+    return
+  fi
+
+  _days=$(( (_end - $(date -u +%s)) / 86400 ))
+
+  if [ "$_days" -lt "$WARN_DAYS" ]; then
+    echo "DOWN $_host cert expires in ${_days}d"
+    push "$_token" down "cert expires in ${_days} days" "$_days"
+    return
+  fi
+
+  # Days remaining is pushed as the ping value, so uptime-kuma graphs it. A
+  # healthy fleet shows a sawtooth resetting at each renewal; a line trending
+  # to zero means renewal has stopped working, visible well before an outage.
+  echo "UP $_host cert ${_days}d"
+  push "$_token" up "cert ok, ${_days} days" "$_days"
+}
+
 for n in $NODES; do
   check "$n" doh
   check "$n" dot
+  check_cert "$n"
 done
 
 exit $rc
