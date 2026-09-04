@@ -18,7 +18,7 @@ pub async fn check(prober: &Prober, node: &Node, ip: IpAddr) -> Outcome {
     };
 
     if days < prober.warn_days {
-        return Outcome::down(format!("cert expires in {days} days"), days as f64);
+        return Outcome::down_final(format!("cert expires in {days} days"), days as f64);
     }
 
     // Days remaining is pushed as the ping value so uptime-kuma graphs it. A

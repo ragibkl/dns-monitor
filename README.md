@@ -43,6 +43,14 @@ Certificates are read from the handshake the check already performs, and each
 node's address is resolved once per round so all three of its checks address
 the same server.
 
+A failed check is repeated once, after a short pause, before it is reported
+down. A single bad probe used to be enough to notify, and in practice most were
+transient: three alerts on 4 September were each one failed check that passed
+again on the next round. Confirming costs one extra probe on the rare failing
+check, and a real outage is still reported within the round it started in. A
+certificate near expiry is reported the first time, since asking again cannot
+change the answer.
+
 A failed push is logged and left for the next round rather than failing the
 process: uptime-kuma's heartbeat window is wider than one interval, so a single
 miss is absorbed.
