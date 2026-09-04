@@ -7,7 +7,41 @@ on:
     branches: ["main"]
 
 jobs:
+  # Runs before anything is published. Images are pushed on pull requests too,
+  # so without this gate a PR image could be deployed against the real
+  # resolvers without its tests having run once.
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Reuses the image's own toolchain, so the tests run against the same
+      # Alpine/musl target that ships, and the compile is cached for the
+      # publish job below rather than paid for twice.
+      - name: Build builder stage
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: builder
+          load: true
+          tags: dns-monitor:ci-builder
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Unit tests and clippy
+        run: |
+          docker run --rm dns-monitor:ci-builder sh -c '
+            apk add --quiet rust-clippy &&
+            cargo test --release &&
+            cargo clippy --all-targets --release -- -D warnings
+          '
+
   build:
+    # Nothing is published unless the tests above pass.
+    needs: test
     runs-on: ubuntu-latest
 
     permissions:
@@ -33,14 +67,19 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=pr
-            type=sha,format=long
+            type=sha
             type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
 
       - uses: docker/setup-buildx-action@v3
 
+      # Published on pull requests too, as ghcr.io/ragibkl/dns-monitor:pr-<n>,
+      # so a change can be run against the real resolvers from a scratch
+      # Deployment before it reaches main. Matches simplesolat-api and
+      # dnsdist-acme, which both publish unconditionally.
       - uses: docker/build-push-action@v6
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' }}
+          cache-from: type=gha
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
