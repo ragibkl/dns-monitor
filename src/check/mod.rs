@@ -52,6 +52,11 @@ pub struct Outcome {
     pub msg: String,
     /// Latency in ms for `doh`/`dot`; days remaining for `cert`.
     pub ping: f64,
+    /// Whether a second attempt could plausibly answer differently. A timeout
+    /// or a dropped connection is worth confirming before waking anyone; a
+    /// certificate that really is close to expiry is not, and retrying it would
+    /// only spend another handshake to be told the same thing.
+    pub retryable: bool,
 }
 
 impl Outcome {
@@ -60,14 +65,27 @@ impl Outcome {
             up: true,
             msg: msg.into(),
             ping,
+            retryable: false,
         }
     }
 
+    /// Down because something failed, which a retry may disagree with.
     pub fn down(msg: impl Into<String>, ping: f64) -> Self {
         Self {
             up: false,
             msg: msg.into(),
             ping,
+            retryable: true,
+        }
+    }
+
+    /// Down because the check ran fine and the answer itself is bad.
+    pub fn down_final(msg: impl Into<String>, ping: f64) -> Self {
+        Self {
+            up: false,
+            msg: msg.into(),
+            ping,
+            retryable: false,
         }
     }
 
@@ -198,13 +216,59 @@ where
 
 /// uptime-kuma stores a push message verbatim and shows it on one line, so keep
 /// it to something that reads in the monitor list.
+///
+/// Both ends are kept and the middle is elided, because the two ends carry
+/// different information and either alone is not enough to act on. The head
+/// says which check failed; the tail holds the innermost cause, which is where
+/// anyhow puts the part worth reading -- truncating the tail turned
+/// "...client error (SendRequest): connection closed before message completed"
+/// into "...client error (Send", which named no cause at all.
 pub fn truncate(msg: &str) -> String {
-    const MAX: usize = 110;
+    const MAX: usize = 200;
+    const HEAD: usize = 70;
 
     let msg = msg.replace('\n', " ");
-    if msg.chars().count() <= MAX {
+    let count = msg.chars().count();
+    if count <= MAX {
         return msg;
     }
 
-    msg.chars().take(MAX - 1).chain(['\u{2026}']).collect()
+    let tail = MAX - HEAD - 1;
+    let head: String = msg.chars().take(HEAD).collect();
+    let tail: String = msg.chars().skip(count - tail).collect();
+
+    format!("{head}…{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_messages_are_left_alone() {
+        assert_eq!(truncate("doh ok"), "doh ok");
+    }
+
+    #[test]
+    fn long_messages_keep_the_cause_at_the_end() {
+        let msg = format!("doh: request failed: {} client error (SendRequest): \
+             connection closed before message completed", "x".repeat(200));
+        let out = truncate(&msg);
+
+        assert!(out.chars().count() <= 200);
+        assert!(out.starts_with("doh: request failed:"));
+        assert!(out.ends_with("connection closed before message completed"));
+    }
+
+    #[test]
+    fn a_failure_is_worth_confirming_but_a_bad_answer_is_not() {
+        assert!(Outcome::down("dot: timed out", 0.0).retryable);
+        assert!(!Outcome::down_final("cert expires in 3 days", 3.0).retryable);
+        assert!(!Outcome::up("dot ok", 1.0).retryable);
+    }
+
+    #[test]
+    fn newlines_do_not_break_the_single_line_display() {
+        assert!(!truncate("a\nb").contains('\n'));
+    }
 }

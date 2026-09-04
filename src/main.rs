@@ -3,7 +3,7 @@ mod config;
 mod health;
 mod kuma;
 
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, net::IpAddr, sync::Arc, time::Duration};
 
 use anyhow::bail;
 use clap::Parser;
@@ -27,6 +27,11 @@ const PUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A round is late, rather than merely slow, once this many intervals pass.
 const STALE_ROUNDS: u32 = 3;
+
+/// Pause before repeating a failed check. Long enough not to land in the same
+/// instant that just failed, short enough that a whole failing fleet still
+/// finishes a round well inside one interval.
+const CONFIRM_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Parser, Debug)]
 #[command(name = "dns-monitor")]
@@ -216,9 +221,47 @@ async fn run_round(prober: Arc<Prober>, kuma: Arc<Kuma>, nodes: Arc<Vec<Node>>) 
     tracing::info!("round finished in {:?}", started.elapsed());
 }
 
+/// Repeats a failed check once before reporting it down.
+///
+/// A single bad probe was enough to notify. The three alerts on 4 September
+/// were each one failed check that passed again on the next round, and the
+/// shell version behaved the same way. Confirming spends one extra probe on
+/// the rare failing check, and a real outage still reports within the round it
+/// started in rather than waiting for the next one.
+///
+/// Only failures are repeated. A certificate genuinely near expiry is reported
+/// the first time, since asking again cannot change the answer.
+async fn confirmed<F, Fut>(node: &Node, proto: Proto, run: F) -> Outcome
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Outcome>,
+{
+    let first = run().await;
+    if first.up || !first.retryable {
+        return first;
+    }
+
+    tracing::info!("RETRY {} {proto} after: {}", node.host, first.msg);
+    tokio::time::sleep(CONFIRM_DELAY).await;
+    run().await
+}
+
+/// Resolution failures take all three of a node's checks down at once, so they
+/// are the loudest thing that can happen and are worth confirming too.
+async fn resolve_confirmed(node: &Node) -> anyhow::Result<IpAddr> {
+    match check::resolve(node).await {
+        Ok(ip) => Ok(ip),
+        Err(err) => {
+            tracing::info!("RETRY {} resolve after: {err:#}", node.host);
+            tokio::time::sleep(CONFIRM_DELAY).await;
+            check::resolve(node).await
+        }
+    }
+}
+
 async fn check_node(prober: &Prober, kuma: &Kuma, node: &Node) {
     // Resolved once for the round so all three checks address the same server.
-    let ip = match check::resolve(node).await {
+    let ip = match resolve_confirmed(node).await {
         Ok(ip) => ip,
         Err(err) => {
             // All three checks depend on the name, so all three are down. Each
@@ -235,9 +278,9 @@ async fn check_node(prober: &Prober, kuma: &Kuma, node: &Node) {
     };
 
     let (doh, dot, cert) = tokio::join!(
-        doh::check(prober, node),
-        dot::check(prober, node, ip),
-        cert::check(prober, node, ip),
+        confirmed(node, Proto::Doh, || doh::check(prober, node)),
+        confirmed(node, Proto::Dot, || dot::check(prober, node, ip)),
+        confirmed(node, Proto::Cert, || cert::check(prober, node, ip)),
     );
 
     tokio::join!(
