@@ -1,12 +1,48 @@
-FROM alpine:3.23
+## builder
+FROM alpine:3.24 AS builder
 
-# knot-utils gives kdig, which speaks both DoH (HTTP/2) and DoT and reports the
-# negotiated HTTP version. curl is used only to push results to uptime-kuma.
-# These are baked in rather than installed at runtime: doing "apk add" on every
-# CronJob tick made the checks depend on the Alpine CDN, and a single failed
-# install produced a false "down" within hours of deploying.
-RUN apk add --no-cache knot-utils curl
+WORKDIR /code/dns-monitor
 
-COPY check.sh /usr/local/bin/check.sh
+# install system dependencies. aws-lc-rs, which rustls uses for its crypto,
+# builds C and needs clang to generate its bindings.
+RUN apk add --no-cache \
+    build-base \
+    cargo \
+    clang \
+    clang-dev \
+    clang-libs \
+    cmake \
+    linux-headers \
+    rust
 
-ENTRYPOINT ["/bin/sh", "/usr/local/bin/check.sh"]
+# setup build dependencies
+RUN cargo init .
+COPY Cargo.toml Cargo.lock ./
+RUN cargo build --release
+RUN rm -rf ./src/
+
+# copy code files
+COPY /src/ ./src/
+
+# build code
+RUN touch ./src/main.rs
+RUN cargo build --release
+
+
+## runtime
+FROM alpine:3.24 AS runtime
+
+# ca-certificates provides the trust store that both the DoH check and the DoT
+# and certificate checks verify against. Without it every check fails closed.
+RUN apk add --no-cache ca-certificates libgcc libstdc++
+
+# set default logging, can be overridden
+ENV RUST_LOG=info
+
+# copy binary
+COPY --from=builder /code/dns-monitor/target/release/dns-monitor /usr/local/bin/dns-monitor
+
+# health server, used as the Deployment's liveness probe
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/dns-monitor"]
