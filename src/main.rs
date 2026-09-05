@@ -1,7 +1,7 @@
 mod check;
 mod config;
 mod health;
-mod kuma;
+mod push;
 
 use std::{future::Future, net::IpAddr, sync::Arc, time::Duration};
 
@@ -18,11 +18,11 @@ use crate::{
     check::{Outcome, Prober, Proto, cert, doh, dot, truncate},
     config::Node,
     health::Health,
-    kuma::Kuma,
+    push::Targets,
 };
 
-/// How long the push to uptime-kuma may take. Independent of the probe timeout:
-/// this is a call to an in-cluster service, not to a resolver on the internet.
+/// How long a push may take. Independent of the probe timeout: this is a call
+/// to an in-cluster service, not to a resolver on the internet.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A round is late, rather than merely slow, once this many intervals pass.
@@ -46,14 +46,17 @@ struct Args {
     #[arg(long, env, value_name = "DOMAIN", default_value = "bancuh.com")]
     domain: String,
 
-    /// Base URL of the uptime-kuma to push results to
-    #[arg(
-        long,
-        env,
-        value_name = "KUMA",
-        default_value = "http://uptime-kuma-svc.uptime-kuma.svc.cluster.local"
-    )]
-    kuma: String,
+    /// Base URL of the uptime-kuma to push results to. Unset to not push there.
+    #[arg(long, env, value_name = "KUMA")]
+    kuma: Option<String>,
+
+    /// Base URL of the Gatus to push results to. Unset to not push there.
+    #[arg(long, env, value_name = "GATUS")]
+    gatus: Option<String>,
+
+    /// Bearer token for the Gatus external endpoints. Required with GATUS.
+    #[arg(long, env, value_name = "GATUS_TOKEN")]
+    gatus_token: Option<String>,
 
     /// Name to resolve
     #[arg(long, env, value_name = "QNAME", default_value = "careers.opendns.com")]
@@ -94,6 +97,8 @@ async fn main() -> anyhow::Result<()> {
         nodes,
         domain,
         kuma,
+        gatus,
+        gatus_token,
         qname,
         timeout,
         warn_days,
@@ -110,7 +115,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("nodes: [{}]", nodes.join(", "));
     tracing::info!("domain: {domain}");
-    tracing::info!("kuma: {kuma}");
+
     tracing::info!("qname: {qname}");
     tracing::info!("timeout: {timeout:?}");
     tracing::info!("warn_days: {warn_days}");
@@ -137,8 +142,19 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    let gatus = match (gatus.as_deref(), gatus_token.as_deref()) {
+        (Some(base), Some(token)) => Some((base, token)),
+        (Some(_), None) => bail!("GATUS is set but GATUS_TOKEN is not"),
+        _ => None,
+    };
+
+    let targets = Arc::new(Targets::new(kuma.as_deref(), gatus, PUSH_TIMEOUT)?);
+    if targets.is_empty() {
+        bail!("no push target configured: set KUMA, GATUS, or both");
+    }
+    tracing::info!("pushing to: {}", targets.names().join(", "));
+
     let prober = Arc::new(Prober::new(&qname, timeout, warn_days)?);
-    let kuma = Arc::new(Kuma::new(&kuma, PUSH_TIMEOUT)?);
     let health = Arc::new(Health::new(interval * STALE_ROUNDS));
 
     let tracker = TaskTracker::new();
@@ -171,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            run_round(prober.clone(), kuma.clone(), nodes.clone()).await;
+            run_round(prober.clone(), targets.clone(), nodes.clone()).await;
             health.round_completed();
         }
     });
@@ -201,15 +217,15 @@ async fn main() -> anyhow::Result<()> {
 /// Checks every node at once. The round takes as long as its slowest single
 /// check, not the sum of all of them, so one unreachable region cannot delay or
 /// starve the checks for the others.
-async fn run_round(prober: Arc<Prober>, kuma: Arc<Kuma>, nodes: Arc<Vec<Node>>) {
+async fn run_round(prober: Arc<Prober>, targets: Arc<Targets>, nodes: Arc<Vec<Node>>) {
     let started = std::time::Instant::now();
 
     let mut set = JoinSet::new();
     for node in nodes.iter() {
         let node = node.clone();
         let prober = prober.clone();
-        let kuma = kuma.clone();
-        set.spawn(async move { check_node(&prober, &kuma, &node).await });
+        let targets = targets.clone();
+        set.spawn(async move { check_node(&prober, &targets, &node).await });
     }
 
     while let Some(joined) = set.join_next().await {
@@ -259,7 +275,7 @@ async fn resolve_confirmed(node: &Node) -> anyhow::Result<IpAddr> {
     }
 }
 
-async fn check_node(prober: &Prober, kuma: &Kuma, node: &Node) {
+async fn check_node(prober: &Prober, targets: &Targets, node: &Node) {
     // Resolved once for the round so all three checks address the same server.
     let ip = match resolve_confirmed(node).await {
         Ok(ip) => ip,
@@ -269,9 +285,9 @@ async fn check_node(prober: &Prober, kuma: &Kuma, node: &Node) {
             let down = |proto: Proto| Outcome::down(truncate(&format!("{proto}: {err:#}")), 0.0);
             let (doh, dot, cert) = (down(Proto::Doh), down(Proto::Dot), down(Proto::Cert));
             tokio::join!(
-                report(kuma, node, Proto::Doh, &doh),
-                report(kuma, node, Proto::Dot, &dot),
-                report(kuma, node, Proto::Cert, &cert),
+                report(targets, node, Proto::Doh, &doh),
+                report(targets, node, Proto::Dot, &dot),
+                report(targets, node, Proto::Cert, &cert),
             );
             return;
         }
@@ -284,13 +300,13 @@ async fn check_node(prober: &Prober, kuma: &Kuma, node: &Node) {
     );
 
     tokio::join!(
-        report(kuma, node, Proto::Doh, &doh),
-        report(kuma, node, Proto::Dot, &dot),
-        report(kuma, node, Proto::Cert, &cert),
+        report(targets, node, Proto::Doh, &doh),
+        report(targets, node, Proto::Dot, &dot),
+        report(targets, node, Proto::Cert, &cert),
     );
 }
 
-async fn report(kuma: &Kuma, node: &Node, proto: Proto, outcome: &Outcome) {
+async fn report(targets: &Targets, node: &Node, proto: Proto, outcome: &Outcome) {
     // The message already names the protocol, e.g. "doh ok".
     if outcome.up {
         tracing::info!("UP {} {} ping={}", node.host, outcome.msg, outcome.ping);
@@ -298,10 +314,8 @@ async fn report(kuma: &Kuma, node: &Node, proto: Proto, outcome: &Outcome) {
         tracing::warn!("DOWN {} {}", node.host, outcome.msg);
     }
 
-    // A failed push is logged and left for the next round. uptime-kuma's
-    // heartbeat window is wider than one interval, so a single miss is absorbed
+    // A failed push is logged and left for the next round. The heartbeat window
+    // on both targets is wider than one interval, so a single miss is absorbed
     // rather than being escalated into a failed run.
-    if let Err(err) = kuma.push(node, proto, outcome).await {
-        tracing::warn!("push failed for {} {proto}: {err:#}", node.host);
-    }
+    targets.report(node, proto, outcome).await;
 }

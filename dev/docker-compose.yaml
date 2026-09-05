@@ -1,0 +1,19 @@
+# Local harness for developing the Gatus push path against a real Gatus.
+#   docker compose -f dev/docker-compose.yaml up --build
+#   curl -s localhost:8080/api/v1/endpoints/statuses
+services:
+  gatus:
+    image: twinproduction/gatus:v5.36.0
+    ports: ["8080:8080"]
+    volumes: ["./gatus.yaml:/config/config.yaml:ro"]
+
+  dns-monitor:
+    build:
+      context: ..
+    environment:
+      NODES: "sg-dns1 fr-dns1"
+      INTERVAL: "30"
+      GATUS: "http://gatus:8080"
+      GATUS_TOKEN: "prototype-token"
+      RUST_LOG: "info"
+    depends_on: [gatus]
