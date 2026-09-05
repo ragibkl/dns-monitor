@@ -1,0 +1,68 @@
+# The public instance: Bancuh DNS resolver health only. Nothing here should be
+# anything a Bancuh DNS user cannot already see.
+#
+# Four of the six checks per node are native, certificates included. Only doh
+# and dot are pushed in by
+# dns-monitor, because Gatus cannot do either: its HTTP client never negotiates
+# HTTP/2 (TLSClientConfig set without ForceAttemptHTTP2), and dnsdist 1.9+
+# answers DoH over HTTP/1.1 with a 400; and tls:// on 853 completes a handshake
+# without ever sending a query.
+
+storage:
+  type: memory
+  maximum-number-of-results: 50
+
+endpoints:
+  - name: ipv4
+    group: sg-dns1
+    url: "sg-dns1.bancuh.com:53"
+    dns: { query-type: "A", query-name: "google.com" }
+    interval: 30s
+    conditions: ["[DNS_RCODE] == NOERROR"]
+
+  - name: safesearch
+    group: sg-dns1
+    url: "sg-dns1.bancuh.com:53"
+    dns: { query-type: "CNAME", query-name: "google.com" }
+    interval: 30s
+    conditions:
+      - "[DNS_RCODE] == NOERROR"
+      # The assertion uptime-kuma cannot make: a rewrite pointing somewhere
+      # wrong passes there, because it only checks that a CNAME came back.
+      - "[BODY] == forcesafesearch.google.com."
+
+  - name: logs
+    group: sg-dns1
+    url: "https://sg-dns1.bancuh.com:8443/logs"
+    interval: 30s
+    conditions: ["[STATUS] == 200"]
+
+  - name: cert
+    group: sg-dns1
+    url: "tls://sg-dns1.bancuh.com:443"
+    interval: 30s
+    conditions:
+      - "[CONNECTED] == true"
+      - "[CERTIFICATE_EXPIRATION] > 504h"
+
+  - name: ipv4
+    group: fr-dns1
+    url: "51.158.99.7:53"
+    dns: { query-type: "A", query-name: "google.com" }
+    interval: 30s
+    conditions: ["[DNS_RCODE] == NOERROR"]
+
+  - name: cert
+    group: fr-dns1
+    url: "tls://fr-dns1.bancuh.com:443"
+    interval: 30s
+    conditions:
+      - "[CONNECTED] == true"
+      - "[CERTIFICATE_EXPIRATION] > 504h"
+
+# Fed by dns-monitor. Keys are <group>_<name>, so sg-dns1_doh and so on.
+external-endpoints:
+  - { name: doh,  group: sg-dns1, token: "prototype-token" }
+  - { name: dot,  group: sg-dns1, token: "prototype-token" }
+  - { name: doh,  group: fr-dns1, token: "prototype-token" }
+  - { name: dot,  group: fr-dns1, token: "prototype-token" }
