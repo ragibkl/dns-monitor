@@ -55,8 +55,7 @@ impl Gatus {
             return Ok(());
         }
 
-        let mut query: Vec<(&str, String)> =
-            vec![("success", outcome.up.to_string())];
+        let mut query: Vec<(&str, String)> = vec![("success", outcome.up.to_string())];
 
         if !outcome.up {
             query.push(("error", outcome.msg.clone()));

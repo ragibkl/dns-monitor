@@ -251,8 +251,11 @@ mod tests {
 
     #[test]
     fn long_messages_keep_the_cause_at_the_end() {
-        let msg = format!("doh: request failed: {} client error (SendRequest): \
-             connection closed before message completed", "x".repeat(200));
+        let msg = format!(
+            "doh: request failed: {} client error (SendRequest): \
+             connection closed before message completed",
+            "x".repeat(200)
+        );
         let out = truncate(&msg);
 
         assert!(out.chars().count() <= 200);
