@@ -58,7 +58,10 @@ async fn query(prober: &Prober, node: &Node) -> anyhow::Result<()> {
     let message = Message::from_vec(&body).context("could not parse response")?;
 
     if message.metadata.id != id {
-        bail!("response id {} does not match query {id}", message.metadata.id);
+        bail!(
+            "response id {} does not match query {id}",
+            message.metadata.id
+        );
     }
 
     let rcode = message.metadata.response_code;

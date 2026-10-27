@@ -49,7 +49,10 @@ async fn healthz(State(health): State<Arc<Health>>) -> impl IntoResponse {
             format!("stale: last round finished {age:?} ago\n"),
         )
     } else {
-        (StatusCode::OK, format!("ok: last round finished {age:?} ago\n"))
+        (
+            StatusCode::OK,
+            format!("ok: last round finished {age:?} ago\n"),
+        )
     }
 }
 
