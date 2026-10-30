@@ -3,7 +3,7 @@
 #   curl -s localhost:8080/api/v1/endpoints/statuses
 services:
   gatus:
-    image: twinproduction/gatus:v5.36.0
+    image: twinproduction/gatus:v5.38.0
     ports: ["8080:8080"]
     volumes: ["./gatus.yaml:/config/config.yaml:ro"]
 
