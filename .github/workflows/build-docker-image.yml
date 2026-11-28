@@ -28,6 +28,12 @@ jobs:
           toolchain: ${{ steps.rust.outputs.version }}
           components: rustfmt
 
+      - name: Dockerfile Rust matches .tool-versions
+        run: |
+          docker_rust=$(sed -nE 's/^FROM rust:([0-9.]+)-alpine.* AS builder$/\1/p' Dockerfile)
+          echo "Dockerfile rust:$docker_rust, .tool-versions ${{ steps.rust.outputs.version }}"
+          test "$docker_rust" = "${{ steps.rust.outputs.version }}"
+
       - name: cargo fmt
         run: cargo fmt --check
 
@@ -63,7 +69,7 @@ jobs:
       - name: Unit tests and clippy
         run: |
           docker run --rm dns-monitor:ci-builder sh -c '
-            apk add --quiet rust-clippy &&
+            rustup component add clippy &&
             cargo test --release &&
             cargo clippy --all-targets --release -- -D warnings
           '
@@ -109,6 +115,10 @@ jobs:
         with:
           context: .
           cache-from: type=gha
+          # Always rebuild the runtime stage, so Alpine package fixes (e.g.
+          # ca-certificates) ship even when alpine:3.24 keeps its digest.
+          no-cache-filters: runtime
+          pull: true
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
